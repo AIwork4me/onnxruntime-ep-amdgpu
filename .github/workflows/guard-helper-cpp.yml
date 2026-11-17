@@ -1,0 +1,45 @@
+name: guard-helper-cpp
+
+# Fork-only CI for the Windows device-identity guard patch: compiles and runs
+# the standalone header-only unit test on real compilers. This job validates
+# ONLY the pure decision logic in src/amdgpu/device_identity_guard.h +
+# tests/device_identity_guard_test.cc. It does NOT build the native AMD EP
+# (no HIP SDK / no full repo build) and therefore cannot attest factory
+# integration or on-metal behavior.
+
+on:
+  push:
+    branches: [fix/windows-dxgi-hip-device-identity, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux-gcc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run (g++, C++11, -Wall -Wextra -Werror)
+        run: |
+          g++ --version | head -1
+          g++ -std=c++11 -Wall -Wextra -Werror -o guard_test tests/device_identity_guard_test.cc
+          ./guard_test
+  linux-clang:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run (clang++, C++11, -Wall -Wextra -Werror)
+        run: |
+          clang++ --version | head -1
+          clang++ -std=c++11 -Wall -Wextra -Werror -o guard_test_clang tests/device_identity_guard_test.cc
+          ./guard_test_clang
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Compile and run (MSVC cl, /W4 /WX /EHsc /std:c++14)
+        shell: pwsh
+        run: |
+          cl /nologo /W4 /WX /EHsc /std:c++14 /Fe:guard_test.exe tests\device_identity_guard_test.cc
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          .\guard_test.exe
