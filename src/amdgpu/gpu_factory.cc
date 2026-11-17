@@ -13,10 +13,13 @@
 
 #include "common/enumerate.h"
 #include "common/dynamic_library.h"
+#include "common/plugin_ep_utils.h"
 
+#include "device_identity_guard.h"
 #include "gpu_options.h"
 #include "gpu_ep.h"
 #include "gpu_factory.h"
+#include "hip/utils.h"  // hipGetDeviceCount for DxgiAdapterNumber bounds validation
 
 #include "onnxruntime_ep_device_ep_metadata_keys.h"
 
@@ -325,25 +328,81 @@ Ort::Status ProviderFactory::GetSupportedDevices(const std::vector<Ort::ConstHar
     const gsl::span<OrtEpDevice*>& ep_devices, size_t& num_ep_devices) noexcept
 {
     num_ep_devices = 0;
+#ifdef _WIN32
+    // Windows device identity guard. ORT's "DxgiAdapterNumber" metadata is a DXGI
+    // enumeration position, not a HIP ordinal. Hosts with indirect display adapters
+    // (virtual display drivers, RDP indirect display) enumerate extra zero-output
+    // DXGI adapters that mirror the real GPU's vendor:device:subsystem and can
+    // survive ORT's platform-level dedup, so this factory may be handed a candidate
+    // whose DxgiAdapterNumber is >= hipGetDeviceCount(). Registering it anyway would
+    // later reach the backends as hipSetDevice(n) and fail with hipErrorInvalidDevice
+    // (HIP 101). Query the HIP count once and skip candidates that cannot map to a
+    // valid ordinal; remaining valid candidates are still registered (fail closed per
+    // candidate, not per factory). Pure decision logic lives in device_identity_guard.h.
+    // This call is on the real registration path, not the DLL probe path, so the
+    // DELAYLOAD of amdhip64_7.dll still keeps ORT's provider probing HIP-free.
+    int hip_device_count = -1;
+    if (const hipError_t hip_error = hipGetDeviceCount(&hip_device_count); hip_error != hipSuccess) {
+        hip_device_count = -1;  // unknown: Evaluate() then runs the metadata check only
+        ORT_CXX_LOG_NOEXCEPT(default_logger_, ORT_LOGGING_LEVEL_WARNING,
+            MakeString("amdgpu-ep: hipGetDeviceCount failed with hipError_t ",
+                static_cast<int>(hip_error),
+                "; DxgiAdapterNumber bounds validation is disabled for this call.").c_str());
+    }
+#endif
     for(const auto& [i, device] : enumerate(devices)) {
         if (num_ep_devices >= ep_devices.size()) {
             break;
         }
         if (device.VendorId() == amd::VendorId && device.Type() == OrtHardwareDeviceType_GPU) {
-            Ort::EpDevice ep_device{*this, const_cast<Ort::ConstHardwareDevice&>(device)};
-
-            Ort::ConstKeyValuePairs metadata = ep_device.Device().Metadata();
-
             // Use DxgiAdapterNumber from device metadata as the device_id when available,
             // so the memory info device matches what DX12 uses to identify the adapter.
-            int device_index = i;
+            const char* dxgi_adapter_number = nullptr;
+#ifdef _WIN32
+            const char* luid = nullptr;
+#endif
             std::vector<const char*> keys, values;
-            metadata.GetKeyValuePairs(keys, values);
+            device.Metadata().GetKeyValuePairs(keys, values);
             for (size_t idx = 0; idx < keys.size(); ++idx) {
                 if (strcmp(keys[idx], "DxgiAdapterNumber") == 0) {
-                    device_index = std::atoi(values[idx]);
+                    dxgi_adapter_number = values[idx];
                 }
+#ifdef _WIN32
+                else if (strcmp(keys[idx], "LUID") == 0) {
+                    luid = values[idx];
+                }
+#endif
             }
+
+            int device_index = i;
+#ifdef _WIN32
+            const device_identity::Verdict verdict = device_identity::Evaluate(
+                device_identity::Candidate{luid, dxgi_adapter_number}, hip_device_count);
+            if (verdict.decision != device_identity::Decision::kAccept) {
+                ORT_CXX_LOG_NOEXCEPT(default_logger_, ORT_LOGGING_LEVEL_WARNING,
+                    MakeString("amdgpu-ep: skipping AMD GPU candidate (LUID=",
+                        luid != nullptr ? luid : "<absent>", ", DxgiAdapterNumber=",
+                        dxgi_adapter_number != nullptr ? dxgi_adapter_number : "<absent>",
+                        ", hipGetDeviceCount()=", hip_device_count, "): ",
+                        device_identity::ToString(verdict.decision),
+                        ". DxgiAdapterNumber is a DXGI enumeration position, not a HIP ordinal; "
+                        "using it as one crashes session creation with HIP error 101 "
+                        "(invalid device ordinal). Recommended action: disable or remove the "
+                        "indirect display driver that mirrors the AMD GPU (virtual display / "
+                        "remote display adapter), or explicitly select the physical GPU "
+                        "(device 0 on single-GPU systems).").c_str());
+                continue;
+            }
+            device_index = verdict.device_index;
+#else
+            // Non-Windows platforms have no DXGI metadata; keep the legacy fallback
+            // (position in the ORT device list) so Linux behavior is unchanged here.
+            if (dxgi_adapter_number != nullptr) {
+                device_index = std::atoi(dxgi_adapter_number);
+            }
+#endif
+
+            Ort::EpDevice ep_device{*this, const_cast<Ort::ConstHardwareDevice&>(device)};
 
             // amdgpu-ep owns these memory info objects for the factory lifetime.
             // The Allocator wrapper's Info() returns gpu_memory_info_, ensuring that
@@ -351,6 +410,17 @@ Ort::Status ProviderFactory::GetSupportedDevices(const std::vector<Ort::ConstHar
             // Note: gpu_memory_info_ and pinned_memory_info_ are overwritten on each
             // iteration, so only the last matched device is retained. This is acceptable
             // for the common single-GPU case; multi-GPU support would require a per-device map.
+            //
+            // TODO(multi-device): the single-slot gpu_memory_info_/pinned_memory_info_
+            // members (and the single gpu_allocator_/pinned_allocator_ wrappers) assume
+            // exactly one accepted candidate. With more than one, every CreateMemoryInfo_V2
+            // call overwrites the previous OrtMemoryInfo* without releasing it (leak), and
+            // the ep_devices registered earlier still reference the overwritten objects,
+            // so only the last device's memory info survives for the factory lifetime.
+            // A correct multi-GPU design needs per-device maps like gpu_memory_infos_/
+            // pinned_memory_infos_ in src/migraphx/mgx_factory.h, plus a real LUID -> HIP
+            // ordinal resolution. This patch intentionally does NOT fix that lifetime
+            // hazard; it only stops candidates with invalid ordinals from being registered.
             RETURN_IF_ERROR(ort_api.CreateMemoryInfo_V2("default", OrtMemoryInfoDeviceType_GPU,
                 amd::VendorId, device_index, OrtDeviceMemoryType_DEFAULT, 0, OrtDeviceAllocator, &gpu_memory_info_));
             RETURN_IF_ERROR(ep_api.EpDevice_AddAllocatorInfo(ep_device, gpu_memory_info_));
